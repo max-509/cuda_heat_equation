@@ -1,39 +1,58 @@
 #include "heat_equation_solver_impl.h"
 
 #include "cuda_utils/cuda_utils.cuh"
-#include "cuda_utils/cublas_utils.cuh"
+
+#include <cub/block/block_reduce.cuh>
+#include <cub/device/device_reduce.cuh>
 
 #include <stdexcept>
-#include <cstdio>
 #include <cstdlib>
 #include <cmath>
-#include <algorithm>
-#include <memory>
 
-namespace {
+namespace
+{
   constexpr std::size_t GRID_BLOCK_SIZE = 16;
+  constexpr std::size_t ERROR_BLOCK_SIZE = 16;
 }
 
 #ifndef N_ERR_COMPUTING_IN_DEVICE
 #define N_ERR_COMPUTING_IN_DEVICE 1500
 #endif // N_ERR_COMPUTING_IN_DEVICE
 
-template <typename T>
-static void compute_error(const T *__restrict__ buff_grid, const std::size_t grid_pitch,
-                       T *__restrict__ diff_buff, const std::size_t diff_pitch,
-                       const size_t grid_size,
-                       const cudaStream_t copy_stream, const cublasHandle_t &handle,
-                       int &err_idx, T &err)
+template <int block_size>
+__global__ void compute_partial_errors(const FLOAT_TYPE *__restrict__ curr_grid,
+                                 const FLOAT_TYPE *__restrict__ next_grid,
+                                 const std::size_t grid_size,
+                                 const std::size_t pitch,
+                                 FLOAT_TYPE *__restrict__ err_ptr)
 {
-  const T a = 1.0;
-  const T b = -1.0;
+  using BlockReduce = cub::BlockReduce<FLOAT_TYPE, block_size, cub::BLOCK_REDUCE_RAKING_COMMUTATIVE_ONLY, block_size>;
 
-  CUBLAS_CHECK(cublasGeam(handle, CUBLAS_OP_T, CUBLAS_OP_T, grid_size, grid_size,
-                          &a, buff_grid, grid_pitch,
-                          &b, buff_grid + (grid_size * grid_pitch), grid_pitch,
-                          diff_buff, diff_pitch));
-  CUBLAS_CHECK(cublasIamax(handle, grid_size * diff_pitch, diff_buff, 1, &err_idx));
-  CUDA_CHECK(cu_memcpy_async(&err, diff_buff + err_idx, 1, cudaMemcpyDefault, copy_stream));
+  __shared__ typename BlockReduce::TempStorage temp_storage;
+  const auto thread_data_size = grid_size / block_size + ((grid_size % block_size) != 0);
+  const auto i_y_begin = threadIdx.y * thread_data_size;
+  const auto i_y_end = min(grid_size, i_y_begin + thread_data_size);
+  const auto i_x_begin = threadIdx.x * thread_data_size;
+  const auto i_x_end = min(grid_size, i_x_begin + thread_data_size);
+
+  FLOAT_TYPE abs_diff = 0.0;
+
+  #pragma unroll
+  for (std::size_t i_y = i_y_begin; i_y < i_y_end; ++i_y)
+  {
+    for (std::size_t i_x = i_x_begin; i_x < i_x_end; ++i_x)
+    {
+      const auto grid_idx = i_y * pitch + i_x;
+      abs_diff = fmax(abs_diff, fabs(curr_grid[grid_idx] - next_grid[grid_idx]));
+    }
+  }
+
+  auto block_max_err = BlockReduce(temp_storage).Reduce(abs_diff, cub::Max{});
+
+  if (threadIdx.x == 0)
+  {
+    *err_ptr = block_max_err;
+  }
 }
 
 __global__ void grid_recompute(const FLOAT_TYPE *__restrict__ curr_grid,
@@ -63,14 +82,10 @@ int solve_heat_equation(FLOAT_TYPE *__restrict__ init_grid,
                         FLOAT_TYPE *last_etol)
 {
   const std::size_t grid_sqr = grid_size * grid_size;
-
-  auto cublas_handle_unique = cublas_init_handle();
-  auto cu_streams_unique = cu_create_streams(3);
+  auto cu_streams_unique = cu_create_streams(2);
 
   std::size_t grid_pitch;
   auto cu_buff_grid_unique = cu_make_pitched_memory_unique<FLOAT_TYPE>(2 * grid_size, grid_size, grid_pitch);
-  std::size_t diff_pitch;
-  auto cu_diff_buff_unique = cu_make_pitched_memory_unique<FLOAT_TYPE>(grid_size, grid_size, diff_pitch);
 
   auto cu_init_grid_pinned_unique = cu_make_pinned_memory_unique(init_grid, grid_sqr);
 
@@ -83,17 +98,12 @@ int solve_heat_equation(FLOAT_TYPE *__restrict__ init_grid,
                                cu_init_grid_pinned_unique.get(), grid_size,
                                grid_size, grid_size,
                                cudaMemcpyDefault, cu_streams_unique[1]));
-  CUDA_CHECK(cu_memset2D_async(cu_diff_buff_unique.get(), diff_pitch, 0, grid_size, grid_size, cu_streams_unique[2]));
 
   CUDA_CHECK(cudaDeviceSynchronize());
-
-  CUBLAS_CHECK(cublasSetStream(*cublas_handle_unique.get(), cu_streams_unique[0]));
 
   auto cu_err_unique = cu_make_host_memory_unique<FLOAT_TYPE>();
   FLOAT_TYPE &err = *cu_err_unique.get();
   err = INFINITY;
-
-  auto cu_err_idx_unique = cu_make_host_memory_unique<int>();
 
   size_t curr_iter;
   size_t n_err_iter;
@@ -113,17 +123,11 @@ int solve_heat_equation(FLOAT_TYPE *__restrict__ init_grid,
           cu_buff_grid_unique.get() + half_buff_grid_size, cu_buff_grid_unique.get(), grid_size, grid_pitch);
     }
 
-    compute_error(cu_buff_grid_unique.get(), grid_pitch, cu_diff_buff_unique.get(), diff_pitch, grid_size, cu_streams_unique[0], *cublas_handle_unique.get(), *cu_err_idx_unique.get(), err);
+    compute_partial_errors<ERROR_BLOCK_SIZE><<<1, dim3(ERROR_BLOCK_SIZE, ERROR_BLOCK_SIZE), 0, cu_streams_unique[0]>>>(
+        cu_buff_grid_unique.get(), cu_buff_grid_unique.get() + half_buff_grid_size, grid_size, grid_pitch, &err);
 
     CUDA_CHECK(cudaStreamSynchronize(cu_streams_unique[0]));
-
-    if (err < 0.0)
-    {
-      err = -err;
-    }
   }
-
-  CUDA_CHECK(cudaStreamSynchronize(cu_streams_unique[0]));
 
   CUDA_CHECK(cu_memcpy2D_async(cu_init_grid_pinned_unique.get(), grid_size,
                                cu_buff_grid_unique.get(), grid_pitch,
@@ -143,5 +147,5 @@ int solve_heat_equation(FLOAT_TYPE *__restrict__ init_grid,
 
 const char *get_solver_version()
 {
-  return "CUDA once mem alloc";
+  return "CUDA CUB one block";
 }

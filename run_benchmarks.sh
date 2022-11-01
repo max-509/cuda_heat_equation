@@ -10,7 +10,7 @@ if [ ! -f $BENCHMARKS_TABLE ]; then
     echo "Target device;Algo ver;Grid size;Number of iters;Elapsed Time;Last error" > $BENCHMARKS_TABLE
 fi
 
-VERSIONS="openacc_gpu cuda_naive cuda_without_sync cuda_once_mem_alloc"
+VERSIONS="openacc_gpu cuda_naive cuda_without_sync cuda_once_mem_alloc cuda_cub_one_block cuda_cub_partial_errors"
 
 make clean
 make
